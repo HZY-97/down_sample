@@ -32,3 +32,31 @@ target_link_libraries(
     ${PCL_LIBRARIES}
     glog::glog
 )
+install(
+    TARGETS ds
+    DESTINATION .
+)
+
+set_target_properties(
+    ds
+    PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
+#===============================
+add_executable(tran src/trans_main.cpp)
+
+target_link_libraries(
+    tran
+    ${PCL_LIBRARIES}
+    glog::glog
+)
+install(
+    TARGETS tran
+    DESTINATION .
+)
+
+set_target_properties(
+    tran
+    PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
