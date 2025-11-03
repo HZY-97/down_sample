@@ -39,8 +39,6 @@ std::mutex octreeDownSample_mtx;
 void OctreeDownSample(PointCloudXYZI::Ptr& input_cloud,
                       PointCloudXYZI::Ptr& output_cloud, float resolution,
                       int thread_num = 1) {
-  // 多线程操作
-  int num_threads = thread_num;
   // 检查输入点云是否为空
   if (!input_cloud || input_cloud->points.empty()) {
     LOG(ERROR) << "Input cloud is empty or null!";
@@ -52,38 +50,57 @@ void OctreeDownSample(PointCloudXYZI::Ptr& input_cloud,
   output_cloud->height = 1;
   output_cloud->is_dense = true;
 
-  // 计算每个线程处理的点云大小
+  int num_threads = thread_num;
   size_t num_points = input_cloud->points.size();
-  size_t points_per_thread = num_points / num_threads;
 
-  // 创建一个线程池
+  // 1. 找到点云在X轴方向的边界
+  float min_x = std::numeric_limits<float>::max();
+  float max_x = std::numeric_limits<float>::lowest();
+
+  for (const auto& point : input_cloud->points) {
+    min_x = std::min(min_x, point.x);
+    max_x = std::max(max_x, point.x);
+  }
+
+  // 2. 计算每个线程负责的X轴范围
+  float x_range = max_x - min_x;
+  float x_step = x_range / num_threads;
+
+  // 3. 根据X坐标将点云分配到不同的切片
+  std::vector<PointCloudXYZI::Ptr> slice_clouds(num_threads);
+  for (int i = 0; i < num_threads; ++i) {
+    slice_clouds[i].reset(new PointCloudXYZI());
+  }
+
+  for (const auto& point : input_cloud->points) {
+    // 计算该点属于哪个线程
+    int thread_id = static_cast<int>((point.x - min_x) / x_step);
+    // 处理边界情况（max_x的点可能会超出范围）
+    if (thread_id >= num_threads) {
+      thread_id = num_threads - 1;
+    }
+    slice_clouds[thread_id]->points.push_back(point);
+  }
+
+  // 4. 创建线程池和结果存储
   std::vector<std::thread> threads;
-
-  // 创建一个临时点云以存储每个线程的结果
   std::vector<PointCloudXYZI::Ptr> temp_results(num_threads);
   for (int i = 0; i < num_threads; ++i) {
     temp_results[i].reset(new PointCloudXYZI());
   }
 
+  // 5. 多线程处理
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
-      // 每个线程创建自己的八叉树对象
+      // 如果该切片为空，跳过
+      if (slice_clouds[i]->points.empty()) {
+        return;
+      }
+
+      // 创建八叉树
       pcl::octree::OctreePointCloudSearch<pcl::PointXYZINormal> octree(
           resolution);
-
-      // 每个线程处理自己的点云切片
-      size_t start_index = i * points_per_thread;
-      size_t end_index =
-          (i == num_threads - 1) ? num_points : start_index + points_per_thread;
-
-      // 获取当前线程的输入切片
-      PointCloudXYZI::Ptr slice_cloud(new PointCloudXYZI);
-      slice_cloud->points.insert(slice_cloud->points.end(),
-                                 input_cloud->points.begin() + start_index,
-                                 input_cloud->points.begin() + end_index);
-
-      // 设置输入点云
-      octree.setInputCloud(slice_cloud);
+      octree.setInputCloud(slice_clouds[i]);
       octree.addPointsFromInputCloud();
 
       // 获取所有叶节点的体素中心点
@@ -92,13 +109,10 @@ void OctreeDownSample(PointCloudXYZI::Ptr& input_cloud,
           voxel_centers;
       octree.getOccupiedVoxelCenters(voxel_centers);
 
-      // 遍历每个叶节点（体素中心点）
+      // 遍历每个体素
       for (const auto& centroid : voxel_centers) {
         std::vector<int> point_indices;
-
-        // 查找体素中包含的所有点索引
         if (octree.voxelSearch(centroid, point_indices)) {
-          // 将体素中心点转换为 Eigen::Vector3f 以便进行距离计算
           Eigen::Vector3f centroid_vector = centroid.getVector3fMap();
 
           // 找到距离质心最近的点
@@ -106,7 +120,8 @@ void OctreeDownSample(PointCloudXYZI::Ptr& input_cloud,
           int closest_point_index = -1;
 
           for (int index : point_indices) {
-            Eigen::Vector3f point = slice_cloud->points[index].getVector3fMap();
+            Eigen::Vector3f point =
+                slice_clouds[i]->points[index].getVector3fMap();
             float distance = (point - centroid_vector).squaredNorm();
             if (distance < min_distance) {
               min_distance = distance;
@@ -114,23 +129,22 @@ void OctreeDownSample(PointCloudXYZI::Ptr& input_cloud,
             }
           }
 
-          // 将距离质心最近的点作为代表点添加到临时结果中
+          // 添加最近点到结果（不需要锁，因为每个线程写入自己的结果）
           if (closest_point_index != -1) {
-            std::lock_guard<std::mutex> lock(octreeDownSample_mtx);
             temp_results[i]->points.push_back(
-                slice_cloud->points[closest_point_index]);
+                slice_clouds[i]->points[closest_point_index]);
           }
         }
       }
     });
   }
 
-  // 等待所有线程完成
+  // 6. 等待所有线程完成
   for (auto& thread : threads) {
     thread.join();
   }
 
-  // 合并所有临时结果到输出点云中
+  // 7. 合并所有结果
   for (const auto& temp_result : temp_results) {
     output_cloud->points.insert(output_cloud->points.end(),
                                 temp_result->points.begin(),
